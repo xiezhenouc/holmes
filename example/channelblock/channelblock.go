@@ -15,46 +15,35 @@
  * limitations under the License.
  */
 
-package holmes
+package main
 
-type ring struct {
-	data   []int
-	idx    int
-	sum    int
-	maxLen int
+import (
+	mlog "mosn.io/pkg/log"
+	"net/http"
+	"time"
+
+	"mosn.io/holmes"
+)
+
+func init() {
+	http.HandleFunc("/chanblock", channelBlock)
+	go http.ListenAndServe(":10003", nil)
 }
 
-func newRing(maxLen int) ring {
-	return ring{
-		data:   make([]int, 0, maxLen),
-		idx:    0,
-		maxLen: maxLen,
-	}
+func main() {
+	h, _ := holmes.New(
+		holmes.WithCollectInterval("5s"),
+		holmes.WithDumpPath("/tmp"),
+		holmes.WithLogger(holmes.NewFileLog("/tmp/holmes.log", mlog.INFO)),
+		holmes.WithTextDump(),
+		holmes.WithGoroutineDump(10, 25, 2000, 10000, time.Minute),
+	)
+	h.EnableGoroutineDump().Start()
+	time.Sleep(time.Hour)
 }
 
-func (r *ring) push(i int) {
-	if r.maxLen == 0 {
-		return
-	}
+var nilCh chan int
 
-	// the first round
-	if len(r.data) < r.maxLen {
-		r.sum += i
-		r.data = append(r.data, i)
-		return
-	}
-
-	r.sum += i - r.data[r.idx]
-
-	// the ring is expanded, just write to the position
-	r.data[r.idx] = i
-	r.idx = (r.idx + 1) % r.maxLen
-}
-
-func (r *ring) avg() int {
-	// Check if the len(r.data) is zero before dividing
-	if r.maxLen == 0 || len(r.data) == 0 {
-		return 0
-	}
-	return r.sum / len(r.data)
+func channelBlock(wr http.ResponseWriter, req *http.Request) {
+	nilCh <- 1
 }

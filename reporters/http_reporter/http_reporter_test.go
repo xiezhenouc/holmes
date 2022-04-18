@@ -15,46 +15,39 @@
  * limitations under the License.
  */
 
-package holmes
+package http_reporter
 
-type ring struct {
-	data   []int
-	idx    int
-	sum    int
-	maxLen int
-}
+import (
+	"log"
+	"testing"
+	"time"
 
-func newRing(maxLen int) ring {
-	return ring{
-		data:   make([]int, 0, maxLen),
-		idx:    0,
-		maxLen: maxLen,
+	"github.com/gin-gonic/gin"
+)
+
+func TestHttpReporter_Report(t *testing.T) {
+	newMockServer()
+
+	reporter := NewReporter("test", "http://127.0.0.1:8080/profile/upload")
+
+	buf := []byte("test-data")
+	if err := reporter.Report("goroutine", buf, "test", "test-id"); err != nil {
+		log.Fatalf("failed to report: %v", err)
 	}
 }
 
-func (r *ring) push(i int) {
-	if r.maxLen == 0 {
-		return
-	}
+func newMockServer() {
+	r := gin.New()
+	r.POST("/profile/upload", ProfileUploadHandler)
+	go r.Run() // listen and serve on 0.0.0.0:8080 (for windows "localhost:8080")
 
-	// the first round
-	if len(r.data) < r.maxLen {
-		r.sum += i
-		r.data = append(r.data, i)
-		return
-	}
-
-	r.sum += i - r.data[r.idx]
-
-	// the ring is expanded, just write to the position
-	r.data[r.idx] = i
-	r.idx = (r.idx + 1) % r.maxLen
+	time.Sleep(time.Millisecond * 100)
 }
 
-func (r *ring) avg() int {
-	// Check if the len(r.data) is zero before dividing
-	if r.maxLen == 0 || len(r.data) == 0 {
-		return 0
-	}
-	return r.sum / len(r.data)
+func ProfileUploadHandler(c *gin.Context) {
+	ret := map[string]interface{}{}
+	ret["code"] = 1
+	ret["message"] = "success"
+	c.JSON(200, ret)
+	return
 }

@@ -1,8 +1,27 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package holmes
 
 import (
 	"bytes"
+	"fmt"
 	"io/ioutil"
+	"math"
 	"os"
 	"path"
 	"runtime"
@@ -11,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	mem_util "github.com/shirou/gopsutil/mem"
 	"github.com/shirou/gopsutil/process"
 )
 
@@ -42,118 +62,181 @@ func readUint(path string) (uint64, error) {
 	return parseUint(strings.TrimSpace(string(v)), 10, 64)
 }
 
-// only reserve the top 10.
-func trimResult(buffer bytes.Buffer) string {
-	arr := strings.Split(buffer.String(), "\n\n")
-	if len(arr) > 10 {
-		arr = arr[:10]
+// only reserve the top n.
+func trimResultTop(buffer bytes.Buffer) []byte {
+	index := TrimResultTopN
+	arr := strings.SplitN(buffer.String(), "\n\n", TrimResultTopN+1)
+
+	if len(arr) <= TrimResultTopN {
+		index = len(arr) - 1
 	}
-	return strings.Join(arr, "\n\n")
+
+	return []byte(strings.Join(arr[:index], "\n\n"))
 }
 
-// return cpu percent, mem in MB, goroutine num
-// cgroup ver.
-func getUsageCGroup() (float64, float64, int, int, error) {
+// only reserve the front n bytes
+func trimResultFront(buffer bytes.Buffer) []byte {
+	if buffer.Len() <= TrimResultMaxBytes {
+		return buffer.Bytes()
+	}
+	return buffer.Bytes()[:TrimResultMaxBytes-1]
+}
+
+// return values:
+// 1. cpu percent, not division cpu cores yet,
+// 2. RSS mem in bytes,
+// 3. goroutine num,
+// 4. thread num
+func getUsage() (float64, uint64, int, int, error) {
 	p, err := process.NewProcess(int32(os.Getpid()))
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
-
 	cpuPercent, err := p.Percent(time.Second)
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
-
-	// the same with physical machine
-	// need to divide by core
-	cpuPercent = cpuPercent / float64(runtime.GOMAXPROCS(-1))
 
 	mem, err := p.MemoryInfo()
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
 
-	memLimit, err := readUint(cgroupMemLimitPath)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-
-	// mem.RSS / cgroup limit in bytes
-	memPercent := float64(mem.RSS) * 100 / float64(memLimit)
-
+	rss := mem.RSS
 	gNum := runtime.NumGoroutine()
-
 	tNum := getThreadNum()
 
-	return cpuPercent, memPercent, gNum, tNum, nil
+	return cpuPercent, rss, gNum, tNum, nil
 }
 
-// return cpu percent, mem in MB, goroutine num
-// not use cgroup ver.
-func getUsageNormal() (float64, float64, int, int, error) {
-	p, err := process.NewProcess(int32(os.Getpid()))
-	if err != nil {
-		return 0, 0, 0, 0, err
+// get cpu core number limited by CGroup.
+func getCGroupCPUCore() (float64, error) {
+	var cpuQuota uint64
+
+	cpuPeriod, err := readUint(cgroupCpuPeriodPath)
+	if cpuPeriod == 0 || err != nil {
+		return 0, err
 	}
 
-	cpuPercent, err := p.Percent(time.Second)
-	if err != nil {
-		return 0, 0, 0, 0, err
+	if cpuQuota, err = readUint(cgroupCpuQuotaPath); err != nil {
+		return 0, err
 	}
 
-	// The default percent is if you use one core, then 100%, two core, 200%
-	// but it's inconvenient to calculate the proper percent
-	// here we multiply by core number, so we can set a percent bar more intuitively
-	cpuPercent = cpuPercent / float64(runtime.GOMAXPROCS(-1))
+	return float64(cpuQuota) / float64(cpuPeriod), nil
+}
 
-	mem, err := p.MemoryPercent()
+func getCGroupMemoryLimit() (uint64, error) {
+	usage, err := readUint(cgroupMemLimitPath)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return 0, err
 	}
+	machineMemory, err := mem_util.VirtualMemory()
+	if err != nil {
+		return 0, err
+	}
+	limit := uint64(math.Min(float64(usage), float64(machineMemory.Total)))
+	return limit, nil
+}
 
-	gNum := runtime.NumGoroutine()
-
-	tNum := getThreadNum()
-
-	return cpuPercent, float64(mem), gNum, tNum, nil
+func getNormalMemoryLimit() (uint64, error) {
+	machineMemory, err := mem_util.VirtualMemory()
+	if err != nil {
+		return 0, err
+	}
+	return machineMemory.Total, nil
 }
 
 func getThreadNum() int {
 	return pprof.Lookup("threadcreate").Count()
 }
 
-var getUsage func() (float64, float64, int, int, error)
-
-// cpu mem goroutine err.
-func collect() (int, int, int, int, error) {
+// cpu mem goroutine thread err.
+func collect(cpuCore float64, memoryLimit uint64) (int, int, int, int, error) {
 	cpu, mem, gNum, tNum, err := getUsage()
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
 
-	return int(cpu), int(mem), gNum, tNum, nil
+	// The default percent is from all cores, multiply by cpu core
+	// but it's inconvenient to calculate the proper percent
+	// here we divide by core number, so we can set a percent bar more intuitively
+	cpuPercent := cpu / cpuCore
+
+	memPercent := float64(mem) / float64(memoryLimit) * 100
+
+	return int(cpuPercent), int(memPercent), gNum, tNum, nil
 }
 
-func matchRule(history ring, curVal, ruleMin, ruleAbs, ruleDiff int) bool {
+func matchRule(history ring, curVal, ruleMin, ruleAbs, ruleDiff, ruleMax int) (bool, string) {
 	// should bigger than rule min
 	if curVal < ruleMin {
-		return false
+		return false, fmt.Sprintf("curVal [%d]< ruleMin [%d]", curVal, ruleMin)
+	}
+
+	// if ruleMax is enable and current value bigger max, skip dumping
+	if ruleMax != NotSupportTypeMaxConfig && curVal >= ruleMax {
+		return false, ""
 	}
 
 	// the current peak load exceed the absolute value
 	if curVal > ruleAbs {
-		return true
+		return true, fmt.Sprintf("curVal [%d] > ruleAbs [%d]", curVal, ruleAbs)
 	}
 
 	// the peak load matches the rule
 	avg := history.avg()
-	return curVal >= avg*(100+ruleDiff)/100
+	if curVal >= avg*(100+ruleDiff)/100 {
+		return true, fmt.Sprintf("curVal[%d] >= avg[%d]*(100+ruleDiff)/100", curVal, avg)
+	}
+	return false, ""
 }
 
-func getBinaryFileName(filePath string, dumpType configureType) string {
-	var (
-		binarySuffix = time.Now().Format("20060102150405") + ".bin"
-	)
+func getBinaryFileName(filePath string, dumpType configureType, eventID string) string {
+	suffix := time.Now().Format("20060102150405.000") + ".log"
 
-	return path.Join(filePath, type2name[dumpType]+"."+binarySuffix)
+	return path.Join(filePath, check2name[dumpType]+"."+eventID+"."+suffix)
+}
+
+// getBinaryFileNameAndCreate 获取文件路径并创建
+// fix #89
+func getBinaryFileNameAndCreate(dump string, dumpType configureType, eventID string) (*os.File, string, error) {
+	filepath := getBinaryFileName(dump, dumpType, eventID)
+	f, err := os.OpenFile(filepath, defaultLoggerFlags, defaultLoggerPerm)
+	if err != nil && os.IsNotExist(err) {
+		if err = os.MkdirAll(dump, 0o755); err != nil {
+			return nil, filepath, err
+		}
+		f, err = os.OpenFile(filepath, defaultLoggerFlags, defaultLoggerPerm)
+		if err != nil {
+			return nil, filepath, err
+		}
+	}
+	return f, filepath, err
+}
+
+func writeFile(data bytes.Buffer, dumpType configureType, dumpOpts *DumpOptions, eventID string) (string, error) {
+	var buf []byte
+	if dumpOpts.DumpProfileType == textDump && !dumpOpts.DumpFullStack {
+		switch dumpType {
+		case mem, gcHeap, goroutine:
+			buf = trimResultTop(data)
+		case thread:
+			buf = trimResultFront(data)
+		default:
+			buf = data.Bytes()
+		}
+	} else {
+		buf = data.Bytes()
+	}
+
+	file, fileName, err := getBinaryFileNameAndCreate(dumpOpts.DumpPath, dumpType, eventID)
+	if err != nil {
+		return fileName, fmt.Errorf("pprof %v open file failed : %w", type2name[dumpType], err)
+	}
+	defer file.Close() //nolint:errcheck,gosec
+
+	if _, err = file.Write(buf); err != nil {
+		return fileName, fmt.Errorf("pprof %v write to file failed : %w", type2name[dumpType], err)
+	}
+	return fileName, nil
 }
